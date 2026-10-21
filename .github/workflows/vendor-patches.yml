@@ -18,11 +18,13 @@ on:
     branches: [main]
     paths:
       - 'vendor/**'
+      - 'Cargo.toml'
       - 'scripts/check-vendor-ledger.py'
       - '.github/workflows/vendor-patches.yml'
   pull_request:
     paths:
       - 'vendor/**'
+      - 'Cargo.toml'
       - 'scripts/check-vendor-ledger.py'
       - '.github/workflows/vendor-patches.yml'
   workflow_dispatch:

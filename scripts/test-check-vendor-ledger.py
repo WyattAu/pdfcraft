@@ -47,6 +47,7 @@ CASES = [
     ("missing", "absent_module::deleted_regression", "nothing on the path exists"),
     ("missing", "nope.rs", "a file that does not exist"),
     ("missing", "raster::tests::replacement::typos", "a typo past a real prefix"),
+    ("skip", "WgpuError::CreateRenderer", "a CamelCase type path quoted in prose"),
 ]
 
 

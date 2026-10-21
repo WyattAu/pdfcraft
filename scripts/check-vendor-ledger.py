@@ -102,6 +102,8 @@ def classify(cite: str, idx) -> str:
         return "ok" if file_exists(base, idx) else "missing"
     if "::" in cite:
         last = cite.rsplit("::", 1)[-1]
+        if last[:1].isupper():
+            return "skip"      # a type path from prose (e.g. WgpuError::CreateRenderer)
         if symbol_exists(last, idx) or module_exists(last, idx):
             return "ok"
         return "missing"
@@ -140,23 +142,27 @@ def main() -> int:
                 fatal.append(f"cited test not found: {crate}: `{cite}`")
         nums = [int(n) for n in re.findall(r'\((\d+)\)', patches)]
         # patch numbering is a sequence (1)(2)(3)…; prose also parenthesises
-        # numbers (e.g. EXTRA_EMPTY_STEPS (1024)), so keep only a plausible
-        # sequence that actually starts at 1
-        nums = [n for n in nums if n <= 40]
-        if nums and 1 in nums:
-            top = max(nums)
+        # numbers (e.g. a 4 GiB allocation), so take the longest run 1..k that
+        # is fully present, and only among plausible indices. A flat cap goes
+        # wrong once a crate earns more than 40 patches: items past the cap
+        # were dropped and `top` compared against the wrong count.
+        present = {n for n in nums if 0 < n <= 500}
+        top = 0
+        while top + 1 in present:
+            top += 1
             text = crate_text(patched[crate]).lower()
             markers = text.count(MARKER)
             if markers < top:
                 warnings.append(f"ledger claims {top} patches for {crate} but only {markers} 'pdfcraft patch' markers in source")
 
-    # prose patch notes below the table also cite tests
-    tail = ledger.split("## ", 1)
-    if len(tail) > 1:
-        for cite in CITED.findall(tail[1]):
-            state = classify(cite, idx)
-            if state == "missing":
-                fatal.append(f"cited test not found (prose): `{cite}`")
+    # prose around the table also cites tests; scan every non-table line so
+    # notes above the first heading are checked too (table cells were already
+    # checked per row above)
+    prose = "\n".join(l for l in ledger.splitlines() if not l.lstrip().startswith("|"))
+    for cite in CITED.findall(prose):
+        state = classify(cite, idx)
+        if state == "missing":
+            fatal.append(f"cited test not found (prose): `{cite}`")
 
     for crate in patched:
         if not re.search(rf'^\|\s*{re.escape(crate)}\s*\|', ledger, re.M):
