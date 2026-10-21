@@ -58,10 +58,13 @@ def all_texts() -> tuple[tuple[str, str], ...]:
 
 @lru_cache(maxsize=1)
 def index() -> tuple[frozenset[str], frozenset[str], frozenset[str]]:
-    """(test fn names, module names, file basenames) across vendor/* and apps/."""
+    """(test fn names, module names, file basenames) across vendor/*, apps/ and crates/."""
     texts, names = [], []
-    for crate in sorted(p.name for p in (ROOT / "vendor").iterdir() if p.is_dir()) + ["pdfcraft"]:
-        base = ROOT / "vendor" / crate if crate != "pdfcraft" else ROOT / "apps" / "pdfcraft"
+    bases = [ROOT / "vendor" / c for c in sorted(p.name for p in (ROOT / "vendor").iterdir() if p.is_dir())]
+    bases += [ROOT / "apps" / "pdfcraft", ROOT / "crates"]
+    for base in bases:
+        if not base.is_dir():
+            continue
         for path in base.rglob("*.rs"):
             try:
                 texts.append(path.read_text(errors="replace"))
@@ -73,35 +76,36 @@ def index() -> tuple[frozenset[str], frozenset[str], frozenset[str]]:
     mods = frozenset(re.findall(r'\bmod\s+([A-Za-z_][A-Za-z0-9_]*)\b', blob))
     return fns, mods, frozenset(names)
 
-def symbol_exists(symbol: str) -> bool:
-    return symbol in index()[0]
+def symbol_exists(symbol: str, idx) -> bool:
+    return symbol in idx[0]
 
-def module_exists(name: str) -> bool:
-    return name in index()[1]
+def module_exists(name: str, idx) -> bool:
+    return name in idx[1]
 
-def file_exists(name: str) -> bool:
-    return name.rsplit("/", 1)[-1] in index()[2]
+def file_exists(name: str, idx) -> bool:
+    return name.rsplit("/", 1)[-1] in idx[2]
 
-def classify(cite: str) -> str:
-    """ok | missing | skip — one backticked token from the ledger."""
+def classify(cite: str, idx) -> str:
+    """ok | missing | skip — one backticked token from the ledger.
+
+    Resolution is by the citation's FINAL segment only: a test fn or a module
+    the citation itself names. The parent path is context, not proof —
+    `mod tests` exists in almost every crate, so accepting a parent module
+    let `raster::tests::deleted_fn` pass after the test was deleted (found
+    in review; see the negative cases in test-check-vendor-ledger.py).
+    """
     cite = cite.strip()
     if not cite or SKIP_TOKEN.search(cite):
         return "skip"          # prose, command, URL
     base = cite.split("::", 1)[0]
     if base.endswith(".rs"):
-        return "ok" if file_exists(base) else "missing"
+        return "ok" if file_exists(base, idx) else "missing"
     if "::" in cite:
         last = cite.rsplit("::", 1)[-1]
-        if last in ("tests",) or last.endswith("_tests"):
-            return "ok" if (symbol_exists(last) or module_exists(last)) else "missing"
-        if symbol_exists(last):
+        if symbol_exists(last, idx) or module_exists(last, idx):
             return "ok"
-        # module path like `util::randr`
-        for part in reversed(cite.split("::")[:-1]):
-            if module_exists(part):
-                return "ok"
         return "missing"
-    if symbol_exists(cite) or file_exists(cite):
+    if symbol_exists(cite, idx) or file_exists(cite, idx):
         return "ok"
     return "skip"              # a bare word that is not a test — prose
 
@@ -114,6 +118,7 @@ def main() -> int:
     fatal: list[str] = []
     warnings: list[str] = []
     checked = 0
+    idx = index()
 
     for m in ROW.finditer(ledger):
         crate, version, _lic, patches, tests = m.groups()
@@ -127,7 +132,7 @@ def main() -> int:
             if got != version:
                 fatal.append(f"version drift: ledger says {crate} {version}, manifest says {got}")
         for cite in CITED.findall(tests):
-            state = classify(cite)
+            state = classify(cite, idx)
             checked += 1
             if show_all:
                 print(f"[{state}] {crate}: {cite}")
@@ -149,7 +154,7 @@ def main() -> int:
     tail = ledger.split("## ", 1)
     if len(tail) > 1:
         for cite in CITED.findall(tail[1]):
-            state = classify(cite)
+            state = classify(cite, idx)
             if state == "missing":
                 fatal.append(f"cited test not found (prose): `{cite}`")
 

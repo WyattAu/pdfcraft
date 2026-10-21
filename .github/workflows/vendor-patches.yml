@@ -41,7 +41,9 @@ jobs:
         with:
           persist-credentials: false
       - name: Ledger check
-        run: python3 scripts/check-vendor-ledger.py
+        run: |
+          python3 scripts/test-check-vendor-ledger.py
+          python3 scripts/check-vendor-ledger.py
 
   vendor-tests:
     name: vendor tests (${{ matrix.crate }})
