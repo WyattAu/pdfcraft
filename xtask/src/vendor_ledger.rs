@@ -11,7 +11,7 @@
 //!
 //! 1. *version* — every crate row's Version matches `vendor/<crate>/Cargo.toml`
 //! 2. *cited test* — every backticked test citation resolves to a real test fn,
-//!    test file, or module SOMEWHERE in `vendor/*` or `apps/pdfcraft` — a row
+//!    test file, or module SOMEWHERE in `vendor/*`, `apps/pdfcraft`, or `crates/` — a row
 //!    may cite a proof test that lives in a sibling vendored crate (a
 //!    hayro-syntax patch is proven by hayro's raster tests) or in the app's own
 //!    test suite
@@ -55,6 +55,7 @@ fn read_all_rs(base: &Path) -> String {
     out
 }
 
+/// Collect Rust file paths below a source directory, ignoring unreadable entries.
 fn collect_rs(dir: &Path, out: &mut Vec<PathBuf>) {
     let Ok(entries) = fs::read_dir(dir) else { return };
     for entry in entries.flatten() {
@@ -75,6 +76,7 @@ struct Index {
     files: BTreeSet<String>,
 }
 
+/// Build the process-local name index from every source tree cited by the ledger.
 fn build_index(root: &Path) -> Index {
     let mut bases: Vec<PathBuf> = Vec::new();
     if let Ok(vendor) = fs::read_dir(root.join("vendor")) {
@@ -121,62 +123,76 @@ fn identifiers_after_keywords(text: &str, keywords: &[&str]) -> Vec<Ident> {
     for keyword in keywords {
         let mut rest = text;
         while let Some(pos) = find_keyword(rest, keyword) {
-            let after = &rest[pos + keyword.len()..];
-            let ident = next_ident(after);
-            let valid = match *keyword {
-                // `fn name(` — the paren may follow generics (`fn f<T>(`).
-                "fn" => ident.as_ref().is_some_and(|i| after_ident_paren(after, i.len())),
-                _ => true,
-            };
-            if let (Some(ident), true) = (ident, valid) {
-                out.push(Ident { ident });
+            let Some(after) = rest.get(pos..).and_then(|tail| tail.strip_prefix(keyword)) else { break };
+            let trimmed = after.trim_start();
+            if let Some(ident) = next_ident(trimmed) {
+                let valid = *keyword != "fn" || trimmed.get(ident.len()..).is_some_and(after_ident_paren);
+                if valid {
+                    out.push(Ident { ident: ident.to_owned() });
+                }
             }
-            rest = &rest[pos + keyword.len()..];
+            rest = after;
         }
     }
     out
 }
 
-/// Word-boundary keyword search: the byte before the match must not be a
-/// identifier character.
+/// Find an ASCII keyword outside a longer ASCII identifier, returning a byte boundary.
 fn find_keyword(haystack: &str, keyword: &str) -> Option<usize> {
-    let mut from = 0;
-    while let Some(rel) = haystack[from..].find(keyword) {
-        let pos = from + rel;
-        let before_ok = pos == 0 || !is_ident_byte(haystack.as_bytes()[pos - 1]);
-        let after = pos + keyword.len();
-        let after_ok = after >= haystack.len() || !is_ident_byte(haystack.as_bytes()[after]);
+    if keyword.is_empty() {
+        return None;
+    }
+    let mut from = 0usize;
+    while let Some(rel) = haystack.get(from..)?.find(keyword) {
+        let pos = from.checked_add(rel)?;
+        let before_ok = pos == 0 || haystack.as_bytes().get(pos - 1).is_none_or(|b| !is_ident_byte(*b));
+        let after = pos.checked_add(keyword.len())?;
+        let after_ok = haystack.as_bytes().get(after).is_none_or(|b| !is_ident_byte(*b));
         if before_ok && after_ok {
             return Some(pos);
         }
-        from = pos + keyword.len();
+        from = after;
     }
     None
 }
 
+/// Whether a byte can continue an ASCII Rust identifier.
 fn is_ident_byte(b: u8) -> bool {
     b == b'_' || b.is_ascii_alphanumeric()
 }
 
-fn next_ident(s: &str) -> Option<String> {
-    let start = s.find(|c: char| c == '_' || c.is_ascii_alphanumeric())?;
-    let ident: String = s[start..].chars().take_while(|c| *c == '_' || c.is_ascii_alphanumeric()).collect();
-    let valid = ident.chars().next().is_some_and(|c| c == '_' || c.is_ascii_lowercase() || c.is_ascii_uppercase());
-    if valid { Some(ident) } else { None }
+/// Read an ASCII identifier at the start, without skipping punctuation or prose.
+fn next_ident(s: &str) -> Option<&str> {
+    let first = *s.as_bytes().first()?;
+    if first != b'_' && !first.is_ascii_alphabetic() {
+        return None;
+    }
+    let len = s.bytes().take_while(|b| is_ident_byte(*b)).count();
+    s.get(..len)
 }
 
-/// Whether the text after `ident` (at byte offset `ident_len`) reaches an
-/// opening paren before anything that disqualifies a fn definition (a `;`, a
-/// newline, or another identifier after a generic list without a paren).
-fn after_ident_paren(after: &str, ident_len: usize) -> bool {
-    let rest = &after[ident_len..];
-    let mut depth: usize = 0;
-    for c in rest.chars().take(64) {
-        match c {
-            '(' => return true,
-            '<' => depth += 1,
-            '>' => depth = depth.saturating_sub(1),
-            ';' | '\n' if depth == 0 => return false,
+/// Require `(` immediately after a name, allowing whitespace and balanced generics.
+/// The generic scan is bounded to 64 characters, as in the original lightweight scan.
+fn after_ident_paren(after: &str) -> bool {
+    let rest = after.trim_start();
+    if rest.starts_with('(') {
+        return true;
+    }
+    if !rest.starts_with('<') {
+        return false;
+    }
+    let mut depth = 0usize;
+    for (pos, ch) in rest.char_indices().take(64) {
+        match ch {
+            '<' => depth = depth.saturating_add(1),
+            // A return-type arrow in `F: Fn() -> T` does not close generics.
+            '>' if rest.get(..pos).is_some_and(|prefix| prefix.ends_with('-')) => {}
+            '>' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return rest.get(pos.saturating_add(ch.len_utf8())..).is_some_and(|tail| tail.trim_start().starts_with('('));
+                }
+            }
             _ => {}
         }
     }
@@ -191,10 +207,12 @@ enum Verdict {
     Skip,
 }
 
+/// Identify CamelCase type paths, which are prose rather than test citations.
 fn is_upper_first(ident: &str) -> bool {
     ident.chars().next().is_some_and(|c| c.is_ascii_uppercase())
 }
 
+/// Resolve a file citation by basename across the indexed source trees.
 fn file_exists(name: &str, index: &Index) -> bool {
     let base = name.rsplit('/').next().unwrap_or(name);
     index.files.contains(base)
@@ -217,7 +235,12 @@ fn classify(cite: &str, index: &Index) -> Verdict {
     }
     let base = cite.split("::").next().unwrap_or(cite);
     if base.ends_with(".rs") {
-        return if file_exists(base, index) { Verdict::Ok } else { Verdict::Missing };
+        if !file_exists(base, index) {
+            return Verdict::Missing;
+        }
+        if !cite.contains("::") {
+            return Verdict::Ok;
+        }
     }
     if cite.contains("::") {
         let last = cite.rsplit("::").next().unwrap_or(cite);
@@ -233,6 +256,20 @@ fn classify(cite: &str, index: &Index) -> Verdict {
         return Verdict::Ok;
     }
     Verdict::Skip // a bare word that is not a test — prose
+}
+
+/// A bare snake_case name in the Test column refers to a function or module.
+fn classify_test(cite: &str, index: &Index) -> Verdict {
+    let cite = cite.trim();
+    let verdict = classify(cite, index);
+    if verdict == Verdict::Skip
+        && cite.starts_with(|c: char| c.is_ascii_lowercase())
+        && cite.contains('_')
+        && cite.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+    {
+        return if index.mods.contains(cite) { Verdict::Ok } else { Verdict::Missing };
+    }
+    verdict
 }
 
 /// `name = { path = "vendor/<dir>"` entries of `[patch.crates-io]`:
@@ -333,8 +370,8 @@ fn ledger_rows(ledger: &str) -> Vec<Row> {
             // The tests group runs from the fifth cell to the END of the
             // line, absorbing any further pipes (the Python checker's
             // `(.*?)\s*\|\s*$` anchored the last group at the final pipe).
-            // Stale 4-column rows therefore have their merged content cell
-            // scanned for citations too, exactly as before.
+            // Four-column rows are not parsed: patches and test citations
+            // must be kept in separate cells when consolidating old entries.
             tests: inner[4..].join("|").trim().to_owned(),
         });
     }
@@ -358,24 +395,20 @@ fn backticks(text: &str) -> Vec<&str> {
     cites
 }
 
-/// The longest run `1..=k` of patch numbers fully present, among plausible
-/// indices. Numbers are read from PARENTHESIZED digit groups only
-/// (`\((\d+)\)` in the Python checker): prose also writes "(4 GiB)", and a
-/// bare `4` from it must not stand in for a missing patch (4).
-fn longest_patch_run(patches_cell: &str) -> usize {
-    let mut present: BTreeSet<u32> = BTreeSet::new();
+/// The highest explicit `(n)` patch number (1..=500), including numbers after gaps.
+/// Parentheses must contain only digits: `(4 GiB)` is prose, not patch four.
+fn highest_patch_number(patches_cell: &str) -> usize {
+    let mut top = 0usize;
     let mut rest = patches_cell;
     while let Some(open) = rest.find('(') {
-        let after = &rest[open + 1..];
-        let digits: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
-        if !digits.is_empty() && after[digits.len()..].starts_with(')') && digits.parse::<u32>().is_ok_and(|n| (1..=500).contains(&n)) {
-            present.insert(digits.parse::<u32>().unwrap());
+        let Some(after) = rest.get(open.saturating_add(1)..) else { break };
+        let digits = after.bytes().take_while(u8::is_ascii_digit).count();
+        if after.get(digits..).is_some_and(|tail| tail.starts_with(')'))
+            && let Some(number) = after.get(..digits).and_then(|s| s.parse::<usize>().ok()).filter(|n| (1..=500).contains(n))
+        {
+            top = top.max(number);
         }
         rest = after;
-    }
-    let mut top: usize = 0;
-    while present.contains(&((top + 1) as u32)) {
-        top += 1;
     }
     top
 }
@@ -392,6 +425,7 @@ pub fn run(args: &[String]) -> Result<()> {
     let mut fatal: Vec<String> = Vec::new();
     let mut warnings: Vec<String> = Vec::new();
     let mut checked = 0usize;
+    let mut highest_by_crate = BTreeMap::<String, usize>::new();
 
     for row in ledger_rows(&ledger) {
         let Some(dir) = patched.get(&row.crate_name) else { continue };
@@ -406,7 +440,7 @@ pub fn run(args: &[String]) -> Result<()> {
             }
         }
         for cite in backticks(&row.tests) {
-            let verdict = classify(cite, &index);
+            let verdict = classify_test(cite, &index);
             checked += 1;
             if show_all {
                 println!("[{:?}] {}: {}", verdict, row.crate_name, cite);
@@ -415,14 +449,9 @@ pub fn run(args: &[String]) -> Result<()> {
                 fatal.push(format!("cited test not found: {}: `{}`", row.crate_name, cite));
             }
         }
-        let dir = dir.clone();
-        let top = longest_patch_run(&row.patches);
-        let markers = if top > 0 { crate_text(&root, &dir).to_lowercase().matches("pdfcraft patch").count() } else { 0 };
-        for n in 1..=top {
-            if markers < n {
-                warnings.push(format!("ledger claims {n} patches for {} but only {markers} 'pdfcraft patch' markers in source", row.crate_name));
-            }
-        }
+        let top = highest_patch_number(&row.patches);
+        let highest = highest_by_crate.entry(row.crate_name).or_default();
+        *highest = (*highest).max(top);
     }
 
     // Prose around the table also cites tests; scan every non-table line so
@@ -435,7 +464,14 @@ pub fn run(args: &[String]) -> Result<()> {
         }
     }
 
-    for crate_name in patched.keys() {
+    for (crate_name, dir) in &patched {
+        if let Some(&top) = highest_by_crate.get(crate_name).filter(|&&n| n > 0) {
+            let markers = crate_text(&root, dir).to_lowercase().matches("pdfcraft patch").count();
+            if markers < top {
+                warnings.push(format!("{crate_name}: highest ledger patch is {top}, but the source has only {markers} 'PdfCraft patch' markers"));
+            }
+        }
+
         let has_row = ledger.lines().any(|l| {
             let t = l.trim_start();
             t.starts_with('|') && {
@@ -470,6 +506,17 @@ mod tests {
             mods: BTreeSet::from(["tests".to_owned(), "raster".to_owned()]),
             files: BTreeSet::from(["lib.rs".to_owned(), "raster.rs".to_owned()]),
         }
+    }
+
+    #[test]
+    fn bare_test_names_are_required_only_in_the_test_column() {
+        let mut index = fake_index();
+        index.mods.insert("existing_tests".into());
+        assert_eq!(classify_test("offsets_survive_a_roundtrip", &index), Verdict::Ok);
+        assert_eq!(classify_test("existing_tests", &index), Verdict::Ok);
+        assert_eq!(classify_test("missing_review_regression", &index), Verdict::Missing);
+        assert_eq!(classify("missing_review_regression", &index), Verdict::Skip);
+        assert_eq!(classify_test("cargo test -p a_crate", &index), Verdict::Skip);
     }
 
     #[test]
@@ -511,12 +558,12 @@ mod tests {
     }
 
     #[test]
-    fn longest_patch_run_ignores_prose_numbers() {
-        // (3) present, (5) present but (4) absent: the run is 3, not 5 — and a
-        // prose "4 GiB" must not stand in for a missing patch (4).
-        assert_eq!(longest_patch_run("(1) x; (2) y; (3) z; (5) w (4 GiB)"), 3);
-        assert_eq!(longest_patch_run("(1) (2) (3)"), 3);
-        assert_eq!(longest_patch_run("no numbers"), 0);
+    fn highest_patch_number_ignores_prose_numbers() {
+        // Later patches still count, but a prose size is not a patch number.
+        assert_eq!(highest_patch_number("(1) x; (2) y; (3) z; (5) w (4 GiB)"), 5);
+        assert_eq!(highest_patch_number("(1) (4 GiB)"), 1);
+        assert_eq!(highest_patch_number("(1) (2) (3)"), 3);
+        assert_eq!(highest_patch_number("no numbers"), 0);
     }
 
     #[test]
@@ -553,6 +600,85 @@ ignored = { path = "vendor/ignored" }
         assert_eq!(rows[1].version, "0.45.0");
         assert_eq!(rows[1].patches, "(1) x");
         assert_eq!(rows[1].tests, "`a_test`");
+    }
+
+    #[test]
+    fn function_scan_handles_unicode_prose_without_panicking() {
+        let dir = tempfile_dir();
+        let source = dir.path().join("crates/example/src");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(source.join("lib.rs"), "// fn — the parser\nfn replacement() {}\n").unwrap();
+        let index = build_index(dir.path());
+        assert_eq!(index.fns, BTreeSet::from(["replacement".to_owned()]));
+    }
+
+    #[test]
+    fn file_qualified_citation_requires_its_final_symbol() {
+        let index = fake_index();
+        assert_eq!(classify("lib.rs::tests::deleted_fn", &index), Verdict::Missing);
+        assert_eq!(classify("lib.rs::tests::replacement", &index), Verdict::Ok);
+        assert_eq!(classify("lib.rs::tests", &index), Verdict::Ok);
+        assert_eq!(classify("lib.rs", &index), Verdict::Ok);
+        assert_eq!(classify("missing.rs::tests::replacement", &index), Verdict::Missing);
+    }
+
+    #[test]
+    fn patch_numbers_after_a_gap_still_count() {
+        assert_eq!(highest_patch_number("(1) first; (3) later (4 GiB)"), 3);
+        let patches = (1..=34).map(|n| format!("({n}) patch; ")).collect::<String>();
+        assert_eq!(highest_patch_number(&format!("{patches}(41) x; (42) y; (43) z")), 43);
+    }
+
+    #[test]
+    fn function_scan_rejects_pointers_and_prose_but_keeps_definitions() {
+        let source = "type F = fn(usize) -> u8; // the fn handles things (see x)\n\
+                      fn replacement() {}\nfn generic<T: Into<Vec<u8>>>(value: T) {}\n\
+                      fn callback<F: Fn(usize) -> u8>(f: F) {}\n\
+                      fn _private () {}\nfn 1invalid() {}\nfn broken<T> prose () {}";
+        let names: Vec<_> = identifiers_after_keywords(source, &["fn"]).into_iter().map(|i| i.ident).collect();
+        assert_eq!(names, ["replacement", "generic", "callback", "_private"]);
+        assert!(identifiers_after_keywords(source, &[""]).is_empty());
+    }
+
+    #[test]
+    fn function_scan_handles_multibyte_punctuation_and_whitespace() {
+        for prefix in ["—", "é", "中", "🦀", "(usize) ->", "123"] {
+            let source = format!("fn {prefix} ignored ();\nfn\u{2003}replacement() {{}}");
+            let names: Vec<_> = identifiers_after_keywords(&source, &["fn"]).into_iter().map(|i| i.ident).collect();
+            assert_eq!(names, ["replacement"], "prefix {prefix}");
+        }
+    }
+
+    #[test]
+    fn patch_number_parsing_rejects_prose_overflow_and_out_of_range_values() {
+        assert_eq!(highest_patch_number("(500) (0) (501) (9999999999999999999999999999)"), 500);
+        assert_eq!(highest_patch_number("(4 GiB) (42x) (43 (44)"), 44);
+        assert_eq!(highest_patch_number("— (３) (1) (1)"), 1);
+        assert_eq!(highest_patch_number("() (4 GiB) (43"), 0);
+    }
+
+    #[test]
+    fn hayro_syntax_ledger_keeps_patches_15_through_21_and_their_proofs() {
+        let root = crate::gates::root();
+        let ledger = std::fs::read_to_string(root.join("vendor/README.md")).unwrap();
+        let rows = ledger_rows(&ledger);
+        let index = build_index(&root);
+        let proofs = [
+            (15, "content::tests::windows_keep_every_instruction_at_every_split"),
+            (16, "crypto::tests::aes256_passwords_open_as_typed_and_in_their_saslprep_form"),
+            (17, "raster::tests::group4_fax_with_rows_zero_decodes_to_the_image_height"),
+            (18, "filter::lzw_flate::tests::back_reference_longer_than_its_distance_repeats_its_source"),
+            (19, "raster::tests::group4_fax_with_rows_below_its_height_decodes_to_the_image_height"),
+            (20, "raster::tests::space_before_the_line_break_after_stream_still_renders"),
+            (21, "raster::tests::a_jp2_image_in_a_refused_enumerated_colour_space_is_drawn"),
+        ];
+        for (number, proof) in proofs {
+            assert!(
+                rows.iter().any(|row| row.crate_name == "hayro-syntax" && row.patches.contains(&format!("({number}) ")) && row.tests.contains(proof)),
+                "patch {number} must keep its description and proof"
+            );
+            assert_eq!(classify(proof, &index), Verdict::Ok, "patch {number}: {proof}");
+        }
     }
 
     // -- helpers ---------------------------------------------------------
